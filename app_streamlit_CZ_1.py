@@ -51,6 +51,7 @@ SPECIFIED = [
 ]
 ORDER = SPECIFIED + ["下料类","其他内脏","鸡头+鸡脖+骨架","总计"]
 BASE_FOR_TOTAL = [x for x in ORDER if x not in ("胸类","鸡头+鸡脖+骨架","总计")]
+TOTAL_RATE_EXCLUDE = {"胸类", "鸡头+鸡脖+骨架"}
 
 def _find_col(cols, cands):
     for c in cands:
@@ -117,6 +118,25 @@ def _attach_rate_display(df, df_lw):
                 out = out.merge(lw_day, on="日期", how="left")
                 out["_den"] = out["_lw"].where(out["_lw"].notna() & (out["_lw"]>0), np.nan)
                 out["产成率%"] = (out["产量(kg)"] / out["_den"]) * 100.0
+                # 覆盖“总计”的产成率：排除指定部位
+                if "项目" in out.columns:
+                    total_mask = out["项目"] == "总计"
+                    if total_mask.any():
+                        exclude = set(globals().get("TOTAL_RATE_EXCLUDE", [])) | {"总计"}
+                        base_mask = out["项目"].notna() & (~out["项目"].isin(exclude))
+                        base_rows = out.loc[base_mask, ["日期","产量(kg)"]]
+                        if base_rows.empty:
+                            qty_by_day = out.loc[total_mask, ["日期"]].drop_duplicates()
+                            qty_by_day["_total_rate_qty"] = 0.0
+                        else:
+                            qty_by_day = (base_rows.groupby("日期", as_index=False)["产量(kg)"]
+                                               .sum(min_count=1)
+                                               .rename(columns={"产量(kg)":"_total_rate_qty"}))
+                        out = out.merge(qty_by_day, on="日期", how="left")
+                        out.loc[total_mask, "产成率%"] = (
+                            out.loc[total_mask, "_total_rate_qty"] / out.loc[total_mask, "_den"]
+                        ) * 100.0
+                        out.drop(columns=[c for c in ["_total_rate_qty"] if c in out.columns], inplace=True)
                 out.drop(columns=[c for c in ["_lw","_den"] if c in out.columns], inplace=True)
         return out
     except Exception:
@@ -139,15 +159,36 @@ def read_all_sheets(uploaded):
     except Exception: return None
 # ===== 读取产量（按日按物料号） =====
 def read_qty_per_code_per_day(xls):
-    if xls is None or ("产量" not in xls.sheet_names):
-        return pd.DataFrame(columns=["日期","物料号","产量(kg)"])
-    df = pd.read_excel(xls, "产量")
+    empty = pd.DataFrame(columns=["日期","物料号","产量(kg)"])
+    if xls is None:
+        return empty
+
+    target_sheet = None
+    if "产量" in xls.sheet_names:
+        target_sheet = "产量"
+    else:
+        for name in xls.sheet_names:
+            name_str = str(name)
+            if any(key in name_str for key in ("产量", "生产", "产出")):
+                target_sheet = name
+                break
+
+    if target_sheet is None:
+        try:
+            sheets_preview = ", ".join(map(str, xls.sheet_names[:5]))
+        except Exception:
+            sheets_preview = ""
+        st.warning(f"主数据未找到名为“产量”的工作表（当前工作表：{sheets_preview}...），请确认上传的文件。")
+        return empty
+
+    df = pd.read_excel(xls, target_sheet)
     df.columns = [str(c).strip() for c in df.columns]
     dcol = _pick_col(df.columns, ["日期","记帐日期","记账日期","凭证日期","过账日期","单据日期"])
     ccol = _pick_col(df.columns, _CODE_CANDS)
     qcol = _pick_col(df.columns, ["数量(kg)","数量","净重","净重KG","净重 KG","重量","重量(kg)","KG","kg"])
     if not (dcol and ccol and qcol):
-        return pd.DataFrame(columns=["日期","物料号","产量(kg)"])
+        st.warning("“产量”工作表缺少“日期/物料/数量(kg)”列，无法生成总览。")
+        return empty
     out = pd.DataFrame({
         "日期": pd.to_datetime(df[dcol], errors="coerce").dt.normalize(),
         "物料号": df[ccol].astype(str).str.strip(),
@@ -812,7 +853,8 @@ overview, minors = build_overview(xls, code2major, df_lw, manual_month_df, alloc
 
 st.subheader("总览")
 if overview is None or overview.empty:
-    st.write("无数据")
+    st.error("主数据中未读取到任何有效的产量记录，请检查“产量”工作表及列名（日期/物料/数量）。")
+    st.stop()
 else:
     days = sorted(pd.to_datetime(overview["日期"].dropna().unique()))
     sel  = st.selectbox("选择日期", days, index=len(days)-1 if days else 0, format_func=lambda d: pd.to_datetime(d).strftime("%Y-%m-%d"))
@@ -1075,7 +1117,7 @@ try:
         _default_ref = _first[0] if _first else _month_days[0]
 
         ref_day = st.selectbox(
-            "还原日（同日口径）",
+            "日期",
             _all_days,
             index=_all_days.index(_default_ref),
             format_func=lambda d: pd.to_datetime(d).strftime("%Y-%m-%d")
@@ -1094,7 +1136,7 @@ try:
             st.stop()
 
         rate_parts = st.multiselect(
-            "作为目标的部位（用于获取产成率）",
+            "目标部位",
             proj_all,
             default=[p for p in proj_all if any(k in p for k in ["腿","胸","里肌","翅","骨架","爪","肝","心","脖","胗","油","下料"]) ]
         )
@@ -1174,7 +1216,7 @@ try:
                 continue
 
             selected_codes = st.multiselect(
-                "选择需要还原的物料号",
+                "选择物料号",
                 available_codes,
                 default=available_codes,
                 help="可多选；仅处理所选物料的产量。",
@@ -1189,7 +1231,7 @@ try:
                     global_code_sequence.append(_code)
 
             item_target_map = {}
-            with st.expander("配置每个物料号要还原到的部位", expanded=False):
+            with st.expander("配置物料号", expanded=False):
                 target_choices = proj_all if proj_all else rate_parts
                 for code in selected_codes:
                     if rate_parts:
@@ -1347,7 +1389,7 @@ try:
                     pivot_all["合计(kg)"] = pivot_all.sum(axis=1)
                     pivot_all.loc["总计"] = pivot_all.sum(axis=0)
                     pivot_all = pivot_all.round(2)
-                    st.markdown("### 组合部位还原总览（全部物料号）")
+                    st.markdown("### 组合部位还原总览")
                     st.dataframe(pivot_all, use_container_width=True)
 
                 base_summary = ov_day.groupby("项目", as_index=False)["产量(kg)"].sum()
