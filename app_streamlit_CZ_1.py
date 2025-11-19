@@ -979,90 +979,64 @@ st.markdown("#### 当月无售价的物料号")
 _show_missing = st.checkbox("显示清单", value=True)
 
 if _show_missing:
-    # 全量（当月范围）
-    qty_all = read_qty_per_code_per_day(xls)
-    pr_all  = build_daily_code_price_raw(xls)
-
-    # 当月区间（以当前选择日期 sel 所在月份为准）
-    # days 或 days2 是你下拉框的数据源；用你实际的变量名替换 ↓
-    fallback_days = days if 'days' in locals() else (days2 if 'days2' in locals() else [])
-
-    # 兜底：如果 sel 为空，就用列表最后一个（通常是最新日期）
-    sel_value = globals().get("sel")  # 避免未定义时报 NameError（Cloud 首次加载时常见）
-    if sel_value is None or str(sel_value).strip() == "":
-        sel_value = fallback_days[-1] if fallback_days else None
-    _raw = sel_value
-
-    ts = pd.to_datetime(_raw, errors="coerce")
-    if pd.isna(ts):
-        # 到这里说明还是解析失败，给出提示并中止，避免后续再连环报错
-        import streamlit as st
-
-        st.error("选择的日期无法解析，请检查数据源中的日期格式（建议形如 2025-10-31）。")
-        st.stop()
-
-    # ===== 选定参考月份（稳健版，避免 sel 未定义） =====
-    # 优先用总览选择的 sel；其次用下钻的 sel2；最后用 overview 中最新一天
-    _ref = None
-    if 'sel' in locals():
-        _ref = pd.to_datetime(sel, errors="coerce")
-    elif 'sel2' in locals():
-        _ref = pd.to_datetime(sel2, errors="coerce")
-
-    if (_ref is None) or pd.isna(_ref):
-        _ref = pd.to_datetime(overview["日期"], errors="coerce").max()
-
-    if pd.isna(_ref):
-        st.warning("没有可用日期，无法生成“当月无售价”的清单。")
-        st.stop()
-
-    sel_month = _ref.to_period("M")
-
-    qd  = qty_all.loc[pd.to_datetime(qty_all["日期"]).dt.to_period("M") == sel_month].copy()
-    pd0 = pr_all .loc[pd.to_datetime(pr_all ["日期"]).dt.to_period("M") == sel_month].copy()
-
-    # 容错：缺列时补空列；统一数值类型
-    if "综合单价" not in pd0.columns:
-        pd0["综合单价"] = np.nan
-    if "数量" not in pd0.columns:
-        pd0["数量"] = 0
-
-    pd0["综合单价"] = pd.to_numeric(pd0["综合单价"], errors="coerce")
-    pd0["数量"]    = pd.to_numeric(pd0["数量"],    errors="coerce").fillna(0)
-
-    # “有售价”口径（保持原口径不变）：数量>0 且 单价存在且>0
-    has_price_mask  = (pd0["数量"] > 0) & pd0["综合单价"].notna() & (pd0["综合单价"] > 0)
-    # 在本月任一日有售价即视为“本月有售价”
-    price_codes_month = set(pd0.loc[has_price_mask, "物料号"].dropna().astype(str).unique())
-
-    # 在产量里出现、但整月没有任何有效售价的物料号
-    qd["物料号"] = qd["物料号"].astype(str)
-    _missing = (
-        qd[["物料号"]].drop_duplicates()
-          .loc[lambda d: ~d["物料号"].isin(price_codes_month)]
-    )
-
-    if _missing.empty:
-        st.success("✅ 当月所有参与产量的物料号均至少有一次有效售价记录。")
+    if overview is None or overview.empty:
+        st.warning("没有总览数据，无法生成“当月无售价”的清单。")
     else:
-        # 展示：部位映射 & 本月合计产量
-        miss = (
-            _missing
-            .merge(qd.groupby("物料号", as_index=False)["产量(kg)"].sum(), on="物料号", how="left")
-        )
-        try:
-            miss["部位"] = miss["物料号"].map(code2major).fillna("未映射")
-        except Exception:
-            miss["部位"] = "未映射"
+        # 全量（当月范围）
+        qty_all = read_qty_per_code_per_day(xls)
+        pr_all  = build_daily_code_price_raw(xls)
 
-        miss = (
-            miss.assign(_ord=lambda d: (d["部位"] == "未映射").astype(int))
-                .sort_values(["_ord", "产量(kg)"], ascending=[False, False])
-                .drop(columns="_ord")
-        )
-        miss["产量(kg)"] = pd.to_numeric(miss["产量(kg)"], errors="coerce").round(2)
+        # 选定参考月份：优先 sel / sel2，其次最新日期
+        sel_month = resolve_sel_month(overview)
+        if sel_month is None:
+            st.warning("无法识别可用日期，无法生成“当月无售价”的清单。")
+            st.stop()
 
-        st.dataframe(miss[["物料号", "部位", "产量(kg)"]], use_container_width=True)
+        qd  = qty_all.loc[pd.to_datetime(qty_all["日期"]).dt.to_period("M") == sel_month].copy()
+        pd0 = pr_all .loc[pd.to_datetime(pr_all ["日期"]).dt.to_period("M") == sel_month].copy()
+
+        # 容错：缺列时补空列；统一数值类型
+        if "综合单价" not in pd0.columns:
+            pd0["综合单价"] = np.nan
+        if "数量" not in pd0.columns:
+            pd0["数量"] = 0
+
+        pd0["综合单价"] = pd.to_numeric(pd0["综合单价"], errors="coerce")
+        pd0["数量"]    = pd.to_numeric(pd0["数量"],    errors="coerce").fillna(0)
+
+        # “有售价”口径（保持原口径不变）：数量>0 且 单价存在且>0
+        has_price_mask  = (pd0["数量"] > 0) & pd0["综合单价"].notna() & (pd0["综合单价"] > 0)
+        # 在本月任一日有售价即视为“本月有售价”
+        price_codes_month = set(pd0.loc[has_price_mask, "物料号"].dropna().astype(str).unique())
+
+        # 在产量里出现、但整月没有任何有效售价的物料号
+        qd["物料号"] = qd["物料号"].astype(str)
+        _missing = (
+            qd[["物料号"]].drop_duplicates()
+              .loc[lambda d: ~d["物料号"].isin(price_codes_month)]
+        )
+
+        if _missing.empty:
+            st.success("✅ 当月所有参与产量的物料号均至少有一次有效售价记录。")
+        else:
+            # 展示：部位映射 & 本月合计产量
+            miss = (
+                _missing
+                .merge(qd.groupby("物料号", as_index=False)["产量(kg)"].sum(), on="物料号", how="left")
+            )
+            try:
+                miss["部位"] = miss["物料号"].map(code2major).fillna("未映射")
+            except Exception:
+                miss["部位"] = "未映射"
+
+            miss = (
+                miss.assign(_ord=lambda d: (d["部位"] == "未映射").astype(int))
+                    .sort_values(["_ord", "产量(kg)"], ascending=[False, False])
+                    .drop(columns="_ord")
+            )
+            miss["产量(kg)"] = pd.to_numeric(miss["产量(kg)"], errors="coerce").round(2)
+
+            st.dataframe(miss[["物料号", "部位", "产量(kg)"]], use_container_width=True)
 # === 新增窗口：自定义部位还原（同日） + 分布后总览 ===
 try:
     st.subheader("部位还原")
