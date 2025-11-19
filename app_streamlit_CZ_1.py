@@ -988,7 +988,10 @@ if _show_missing:
     fallback_days = days if 'days' in locals() else (days2 if 'days2' in locals() else [])
 
     # 兜底：如果 sel 为空，就用列表最后一个（通常是最新日期）
-    _raw = sel if (sel is not None and str(sel).strip() != "") else (fallback_days[-1] if fallback_days else None)
+    sel_value = globals().get("sel")  # 避免未定义时报 NameError（Cloud 首次加载时常见）
+    if sel_value is None or str(sel_value).strip() == "":
+        sel_value = fallback_days[-1] if fallback_days else None
+    _raw = sel_value
 
     ts = pd.to_datetime(_raw, errors="coerce")
     if pd.isna(ts):
